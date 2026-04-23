@@ -47,7 +47,7 @@ jobs:
           location              = "francecentral"
           resource_group_name   = "RG-GAN-FRC"
           control_plane_vm_size = "Standard_D2s_v3"
-          worker_vm_size        = "Standard_F1s"
+          worker_vm_size        = "Standard_D2s_v3"
           EOF
 
       - name: Terraform fmt check
