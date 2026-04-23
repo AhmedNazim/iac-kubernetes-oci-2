@@ -1,0 +1,190 @@
+name: Deploy IaC Kubernetes Cluster
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action à exécuter'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+  ARM_ACCESS_KEY:      ${{ secrets.ARM_ACCESS_KEY }}
+  TF_VERSION:          "1.9.0"
+
+jobs:
+  # =========================================================
+  # Job 1 : Terraform (init, validate, plan, apply)
+  # =========================================================
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      cp_ip: ${{ steps.outputs.outputs.cp_ip }}
+      w1_ip: ${{ steps.outputs.outputs.w1_ip }}
+      w2_ip: ${{ steps.outputs.outputs.w2_ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Inject SSH public key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > ~/.ssh/azure_k8s.pub
+          chmod 644 ~/.ssh/azure_k8s.pub
+
+      - name: Generate terraform.tfvars
+        working-directory: terraform
+        run: |
+          cat > terraform.tfvars <<EOF
+          subscription_id       = "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+          worker_count          = 2
+          ssh_public_key_path   = "~/.ssh/azure_k8s.pub"
+          location              = "francecentral"
+          resource_group_name   = "RG-GAN-FRC"
+          control_plane_vm_size = "Standard_D2s_v3"
+          worker_vm_size        = "Standard_B1s"
+          EOF
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=RG-GAN-FRC" \
+            -backend-config="storage_account_name=frcenstotfgan" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=iac-k8s/terraform.tfstate"
+
+      - name: Terraform Format Check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event_name == 'push' || inputs.action == 'apply'
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        working-directory: terraform
+        run: terraform destroy -auto-approve
+
+      - name: Extract outputs
+        id: outputs
+        if: github.event_name == 'push' || inputs.action == 'apply'
+        working-directory: terraform
+        run: |
+          echo "cp_ip=$(terraform output -raw control_plane_ip)" >> $GITHUB_OUTPUT
+          echo "w1_ip=$(terraform output -json worker_ips | jq -r '.[0]')" >> $GITHUB_OUTPUT
+          echo "w2_ip=$(terraform output -json worker_ips | jq -r '.[1]')" >> $GITHUB_OUTPUT
+
+  # =========================================================
+  # Job 2 : Ansible (hardening + K8s bootstrap)
+  # =========================================================
+  ansible:
+    name: Ansible Deploy
+    runs-on: ubuntu-latest
+    needs: terraform
+    if: github.event_name == 'push' || inputs.action == 'apply'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible
+          ansible-galaxy collection install community.general
+
+      - name: Inject SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/azure_k8s
+          chmod 600 ~/.ssh/azure_k8s
+
+      - name: Generate inventory.ini
+        working-directory: ansible
+        run: |
+          cat > inventory.ini <<EOF
+          [control_plane]
+          control-plane ansible_host=${{ needs.terraform.outputs.cp_ip }}
+
+          [workers]
+          worker-1 ansible_host=${{ needs.terraform.outputs.w1_ip }}
+          worker-2 ansible_host=${{ needs.terraform.outputs.w2_ip }}
+
+          [k8s_cluster:children]
+          control_plane
+          workers
+
+          [k8s_cluster:vars]
+          ansible_user=ubuntu
+          ansible_python_interpreter=/usr/bin/python3
+          EOF
+
+      - name: Wait for SSH to be ready
+        run: |
+          for ip in ${{ needs.terraform.outputs.cp_ip }} ${{ needs.terraform.outputs.w1_ip }} ${{ needs.terraform.outputs.w2_ip }}; do
+            echo "Waiting for SSH on $ip..."
+            for i in {1..30}; do
+              if ssh -i ~/.ssh/azure_k8s -o StrictHostKeyChecking=no -o ConnectTimeout=5 ubuntu@$ip "echo ok" 2>/dev/null; then
+                echo "✅ SSH OK on $ip"; break
+              fi
+              sleep 10
+            done
+          done
+
+      - name: Run Ansible playbook (hardening + K8s)
+        working-directory: ansible
+        run: ansible-playbook playbooks/site.yml
+
+  # =========================================================
+  # Job 3 : Validation (kubectl get nodes doit montrer 3 Ready)
+  # =========================================================
+  validate:
+    name: Validate cluster (3 Ready nodes)
+    runs-on: ubuntu-latest
+    needs: [terraform, ansible]
+    if: github.event_name == 'push' || inputs.action == 'apply'
+    steps:
+      - name: Inject SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/azure_k8s
+          chmod 600 ~/.ssh/azure_k8s
+
+      - name: Run kubectl get nodes
+        run: |
+          OUTPUT=$(ssh -i ~/.ssh/azure_k8s -o StrictHostKeyChecking=no ubuntu@${{ needs.terraform.outputs.cp_ip }} "kubectl get nodes --no-headers")
+          echo "$OUTPUT"
+          READY_COUNT=$(echo "$OUTPUT" | awk '$2=="Ready"' | wc -l)
+          echo "Nodes Ready : $READY_COUNT / 3"
+          if [ "$READY_COUNT" -ne 3 ]; then
+            echo "❌ ÉCHEC : on attend 3 nœuds Ready"
+            exit 1
+          fi
+          echo "✅ SUCCÈS : 3 nœuds Ready"
