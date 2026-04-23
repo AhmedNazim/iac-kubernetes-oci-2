@@ -1,0 +1,4 @@
+---
+# Playbook maître : enchaîne hardening puis Kubernetes
+- import_playbook: hardening.yml
+- import_playbook: kubernetes.yml

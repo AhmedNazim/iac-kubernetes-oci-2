@@ -1,0 +1,23 @@
+# ============================================================
+# Modèle de variables — À COPIER en "terraform.tfvars" et remplir
+# ============================================================
+# IMPORTANT : terraform.tfvars est dans le .gitignore.
+# NE JAMAIS committer le fichier terraform.tfvars (il contient vos secrets).
+
+# --- Credentials OCI (récupérés dans la console Oracle) ---
+tenancy_ocid = "ocid1.tenancy.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+user_ocid    = "ocid1.user.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+fingerprint  = "aa:bb:cc:dd:ee:ff:11:22:33:44:55:66:77:88:99:00"
+region       = "eu-paris-1"
+
+# Par défaut : même OCID que tenancy_ocid (on utilise le compartiment root)
+compartment_ocid = "ocid1.tenancy.oc1..xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# --- Chemins de clés (laisser par défaut si vous avez suivi le tuto) ---
+private_key_path    = "~/.oci/oci_api_key.pem"
+ssh_public_key_path = "~/.ssh/oci_k8s.pub"
+
+# --- Nombre de workers Kubernetes ---
+# worker_count = 0  → 1 VM   (control-plane seul, utile pour tester le apply)
+# worker_count = 2  → 3 VMs  (config finale requise par le TP)
+worker_count = 2
